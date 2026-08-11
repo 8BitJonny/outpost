@@ -3,6 +3,71 @@ title: Event & Delivery Log
 description: "Overview of event and delivery log storage, querying, and retention behavior for self-hosted Outpost."
 ---
 
-TODO
+The event and delivery log is Outpost's record of what happened to each event: the event as it was received, and every delivery attempt made for it. It's what backs the events API, the tenant user portal, and manual retries.
 
-Need to talk about data retention and retention policies.
+This is separate from [application logging](/docs/outpost/self-hosting/guides/logging), which covers the stdout and audit logs your services produce.
+
+## What's stored
+
+Outpost records two kinds of thing:
+
+- **Events** — the payload and metadata as published, along with the tenant, topic, and time.
+- **Delivery attempts** — one record per attempt against a destination, with the outcome, the destination's response, and the attempt number.
+
+Configuration data lives elsewhere. Tenants and destinations are stored in Redis, so removing log data never affects a tenant's configured destinations.
+
+Storage grows with delivery attempts rather than event count. An event fanned out to three destinations, with retries against a failing one, produces several attempt records, each carrying its own copy of the event payload. Payload size and retry behavior drive log growth more than publish volume does.
+
+## Choosing a backend
+
+Outpost stores logs in either PostgreSQL or ClickHouse. Set `POSTGRES_URL` or `CLICKHOUSE_ADDR` to select one. See the [Configuration Reference](/docs/outpost/self-hosting/configuration) for the full set of connection variables.
+
+The two are not equivalent for long-running deployments:
+
+| | PostgreSQL | ClickHouse |
+|---|---|---|
+| Built-in retention | No | Yes |
+| Suited to | Lower volume, existing Postgres operations | Higher volume, long retention |
+
+We recommend ClickHouse for production deployments that need retention or run at sustained volume, and it's what Hookdeck operates. PostgreSQL is a reasonable choice at lower volume or when you'd rather not add another datastore, provided you manage retention yourself.
+
+Switching backends later means migrating your existing log data, so it's worth deciding before you accumulate history.
+
+## Retention
+
+Retention determines how long event history stays queryable through the API and the tenant user portal, and how long an event remains available for manual retry. It's a product decision as much as a storage one: a seven day retention means your tenants can't retry anything older than a week.
+
+### ClickHouse
+
+Set `CLICKHOUSE_LOG_RETENTION_TTL_DAYS` to the number of days to keep. `0`, the default, retains logs indefinitely.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLICKHOUSE_LOG_RETENTION_TTL_DAYS` | `0` | Days to retain event and delivery logs. `0` retains indefinitely. |
+
+Outpost applies the value as a ClickHouse TTL on startup, and only when it differs from the value already applied. Three consequences:
+
+- Changing the value takes effect on the next restart, not immediately.
+- A new value applies to existing data, not just to logs written after the change. Lowering the value makes older logs eligible for removal.
+- ClickHouse removes expired data during background merges, so disk space is reclaimed some time after data expires rather than at the moment it does.
+
+Events expire on event time, delivery attempts on attempt time. A retry that happens days after its event expires later than the event does.
+
+### PostgreSQL
+
+Outpost has no built-in retention for PostgreSQL. Without an external retention process, the log grows indefinitely.
+
+The straightforward approach is a scheduled batched delete, oldest first, removing attempts before events:
+
+```sql
+DELETE FROM attempts WHERE time < now() - interval '30 days';
+DELETE FROM events   WHERE time < now() - interval '30 days';
+```
+
+Run these in bounded batches rather than as a single statement, on whatever scheduler you already operate, such as a Kubernetes `CronJob`, a systemd timer, or [pg_cron](https://github.com/citusdata/pg_cron) if the extension is available to you. Both tables have a primary key leading with `time`, so these are index range scans rather than full table scans. You'll still take the dead tuple and vacuum cost that any large delete incurs.
+
+The `events` and `attempts` tables are declared as range partitioned on `time`, but Outpost creates only DEFAULT partitions and doesn't manage the partition lifecycle. Dropping expired partitions is cheaper than deleting rows at scale, so if you're running PostgreSQL at volume, managing partitions yourself with a tool like [pg_partman](https://github.com/pgpartman/pg_partman) is worth considering. Note that existing data sits in the DEFAULT partitions, which affects how you migrate to a partitioned layout. Partition lifecycle management in Outpost is tracked in [issue #249](https://github.com/hookdeck/outpost/issues/249).
+
+## Querying
+
+Event and delivery history is available through the events endpoints of the [Outpost API](/docs/outpost/api), and to your tenants through the [tenant user portal](/docs/outpost/features/tenant-user-portal). Both are backed by whichever log store you configured, so query behavior and retention follow from that choice.
